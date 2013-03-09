@@ -1,0 +1,1 @@
+Implementation of distributed actors I am working on. In a cluster this library provides the ability to have a single instance of an actor cluster wide.
