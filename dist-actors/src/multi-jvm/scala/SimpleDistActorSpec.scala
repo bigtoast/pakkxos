@@ -222,26 +222,31 @@ class SimpleDistActorSpec extends MultiNodeSpec(SimpleDistActorSpecConfig)
       //println("\n\n SHUTTING DOWN 2 \n\n")
 
       runOn(node1) {
-        Cluster(system).subscribe(testActor, classOf[MemberEvent])
+        Cluster(system).subscribe(testActor, classOf[MemberDowned])
         testConductor.removeNode(node2)
         //expectMsgClass(classOf[CurrentClusterState])
         //val addy = node(node1).address
         //Cluster(system).down(node(node1).address)
         Cluster(system).leave(node(node2).address)
         //testConductor.shutdown(node2,0).await
-        expectMsgPF(10 seconds ) {
+        expectMsgType[CurrentClusterState]
+        expectMsgType[MemberDowned]( 15 seconds )
+       /* expectMsgPF(10 seconds ) {
           case msg => println(s"\n\nSPECIAL 1 SPECIAL 1 ${msg}\n\n")
         }
         expectMsgPF(10 seconds ) {
           case msg => println(s"\n\nSPECIAL 2 SPECIAL 2 ${msg}\n\n")
-        }
+        } */
+        //Thread.sleep(5000)
         //expectMsg( 5 seconds, MemberDowned(Member(addy, MemberStatus.Down)))
         Pakkxos(system).registry("/user/testRegistry").execute[Sum](Add("666", 11)) pipeTo testActor
         expectMsg(10 seconds, Sum(3))
 
       }
 
-      enterBarrier("shizzz")
+      runOn(node1, node3) {
+        enterBarrier("shizzz")
+      }
       println("\n\n DONEDONEDONEDONE \n\n")
 
     }

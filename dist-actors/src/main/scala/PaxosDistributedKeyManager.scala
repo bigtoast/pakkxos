@@ -264,7 +264,6 @@ class PaxosDistributedKeyManager( me :Address ) extends Actor
           } else {
             protocol.initiator ! Failure( NoSuchKey(c.key) )
             checkStartPending(protocol.cmd.key,data)
-            data
           }
 
         case c :Delete =>
@@ -273,7 +272,6 @@ class PaxosDistributedKeyManager( me :Address ) extends Actor
           } else {
             protocol.initiator ! Failure( NoSuchKey(c.key) )
             checkStartPending(protocol.cmd.key,data)
-            data
           }
       }
   }
@@ -394,10 +392,15 @@ class PaxosDistributedKeyManager( me :Address ) extends Actor
   /** check to see if there is a pending protocol to start. If there is then start it. */
   def checkStartPending( key :String, data :ProposerData ) :ProposerData = {
     if ( data.pending.contains(key) ) {
-      handle(
-        data.pending(key).head,
-        data.copy( pending =
-          data.pending.updated( key, data.pending(key).tail ).filter{ case (str, vctr) => vctr.nonEmpty } ) )
+      val pend = data.pending(key).head
+      val updated = data.copy( pending =
+        data.pending.updated( key, data.pending(key).tail ).filter{ case (str, vctr) => vctr.nonEmpty } )
+      val now = Platform.currentTime
+      if ( now - pend.createdAt < protocolTimeout ) {
+        handle(pend, updated)
+      } else {
+        updated
+      }
     } else {
       data
     }
@@ -618,9 +621,16 @@ class PaxosDistributedKeyManager( me :Address ) extends Actor
       stay()
 
     case Event( msg :Prepare , data :AcceptorData ) if data.promised.contains(msg.key) =>
-      // options.. no promise, already promised,
-      // @todo what do we do???
-      stay()
+      data.promised(msg.key) match {
+        case num if num < msg.pNum =>
+          val promise = Promise( msg.key, msg.pNum, msg.protocolId )
+          val updated = data.copy( promised = data.promised + ( msg.key -> msg.pNum ) )
+          log.debug("Dropping old promise {} for key {} because new prepare with higher seq {}",num, msg.key, msg)
+          stay using updated replying promise
+        case num =>
+          log.debug("Ignoring Prepare msg {} because already promised {}", msg, num)
+          stay()
+      }
 
     case Event( msg :Prepare, data :AcceptorData ) =>
       // no promise

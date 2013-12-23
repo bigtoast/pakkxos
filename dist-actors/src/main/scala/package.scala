@@ -19,6 +19,11 @@ package object pakkxos {
       case None =>
         up
     }
+
+    def sameUpView( c2 :CurrentClusterState ) = {
+      cluster.leader == c2.leader &&
+      up == c2.up
+    }
   }
 
   implicit def toRichCluster( cluster :CurrentClusterState ) = new RichCurrentClusterView(cluster)

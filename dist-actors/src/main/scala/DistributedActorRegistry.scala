@@ -173,7 +173,7 @@ abstract class DistributedActorRegistry[M]( implicit m :ClassTag[M] ) extends Ac
     context.actorFor(path)
   }
 
-  private[this] val _keepers = new mutable.HashMap[String,ActorRegistration]
+  private[this] val _actors = new mutable.HashMap[String,ActorRegistration]
 
   /** key -> ( ts when added to buffer, buffered action ) */
   private[this] var _requestBuffer = Map.empty[String,Seq[(Long, ChannelAction)]]
@@ -181,7 +181,7 @@ abstract class DistributedActorRegistry[M]( implicit m :ClassTag[M] ) extends Ac
   /**
     * Returns an immutable map of the [K,Keeper]
     */
-  def keepers = _keepers.toMap
+  def keepers = _actors.toMap
 
   /**
     * just for internal uses
@@ -236,7 +236,7 @@ abstract class DistributedActorRegistry[M]( implicit m :ClassTag[M] ) extends Ac
     */
   private[this] def checkSync :Future[Boolean] =
     keyRegistry.list map { mappings =>
-      val out = _keepers.filterNot { case ( key, reg ) =>
+      val out = _actors.filterNot { case ( key, reg ) =>
         mappings.exists( km => km == reg.mapping )
       }
       if ( out.nonEmpty ){
@@ -264,7 +264,7 @@ abstract class DistributedActorRegistry[M]( implicit m :ClassTag[M] ) extends Ac
       }
 
       val reg = ActorRegistration( mp, keeper )
-      _keepers += ( key -> reg  )
+      _actors += ( key -> reg  )
       reg
   }
 
@@ -311,8 +311,16 @@ abstract class DistributedActorRegistry[M]( implicit m :ClassTag[M] ) extends Ac
         ( aRef ask GetRegistrations ).mapTo[Map[String,ActorRegistration]].map { mp => (address, mp) }
       }
     } map { reg =>
-      reg.toMap + ( me -> _keepers.toMap )
+      reg.toMap + ( me -> _actors.toMap )
     }
+  }
+  
+  /** create remote actor refs for all cluster members in Up state. */
+  private[this] def createRegistries( c :CurrentClusterState ) :Map[Address,ActorRef] = {
+    c.allUp.filterNot(_ == me).map { address =>
+      val reg = context.actorFor(RootActorPath(address) / context.self.path.elements )
+      ( address -> reg )
+    }.toMap  
   }
 
   /**
@@ -321,7 +329,7 @@ abstract class DistributedActorRegistry[M]( implicit m :ClassTag[M] ) extends Ac
    *
    * @return Option[ActorRegistration]
    */
-  def getActor( key :String ) = _keepers get key
+  def getActor( key :String ) = _actors get key
 
   /* ######################################################
    * Just Command Handlers Below
@@ -346,37 +354,44 @@ abstract class DistributedActorRegistry[M]( implicit m :ClassTag[M] ) extends Ac
   }
 
   /** handle cluster events. This will put together the hash ring and
-    * will create remote actors for all remote keepers                */
+    * will create remote actors for all remote keepers                
+    * 
+    * When receiving a Leaving event ( down, exiting ?? )
+    * 
+    * Node leaving
+    *   * send poison pill to child actors
+    *   
+    * All nodes
+    *   * Remove registered actor ref
+    * 
+    * Master node 
+    *   * execute remove key registration
+    */
   private[this] def clusterEvents :Receive = {
 
     case c: CurrentClusterState if c.leader.isDefined =>
       println(s"\n\n received new cluster state in AReg ${c} \n\n")
-      _registries = c.allUp.filterNot(_ == me).map { address =>
-        val reg = context.actorFor(RootActorPath(address) / context.self.path.elements )
-        ( address -> reg )
-      }.toMap
+      _registries = createRegistries(c)
       val master = c.leader.get == me
 
       log.info("{} Actor Registry received cluster changed event: {}", context.self, c)
 
       val addys = c.allUp
 
-      _keepers.foreach { case ( key, reg ) =>
-        if ( ! addys.contains(reg.mapping.address) ) {
-          _keepers.remove(key) foreach { kr =>
-            if (master) {
-              log.info("Master DistributedActorRegistry for component {} removing key {}", context.self, key)
-              keyRegistry.remove(key, -1) onComplete {
-                case util.Failure( t ) =>
-                  log.warning("Error removing key {} from actor registry {}. Error: {}", key, context.self, t)
-                case util.Success( true ) =>
-                  log.debug("Removed key {} from actor registry {}", key, context.self )
-                case util.Success( false ) =>
-                  log.warning("Failed to remove key {} from actor registry {}", key, context.self )
+      _actors.foreach { case ( key, reg ) => 
+        if ( ! addys.contains(reg.mapping.address) )
+          _actors.remove(key) match {
+            case Some( reg ) if reg.mapping.address == me =>
+              reg.actor ! PoisonPill
+              keyRegistry.remove(key, reg.mapping.version ) onComplete {
+                case util.Success( result ) =>
+                  log.info(s"Removed registration ${reg} from key registry and actor registry")
+                case util.Failure( error ) =>
+                  log.error(s"Failed removing registration ${reg} from key registry")
               }
-            }
+
+            case _ =>
           }
-        }
       }
 
       if ( master ) {
@@ -466,7 +481,7 @@ abstract class DistributedActorRegistry[M]( implicit m :ClassTag[M] ) extends Ac
 
     case KeyDeregistered( key, _ ) =>
       log.debug("Key {} deregistered. Removing ref.", key)
-      _keepers.remove( key ) foreach {
+      _actors.remove( key ) foreach {
 
         case kr if kr.mapping.address == me =>
           context.stop(kr.actor)
@@ -477,9 +492,9 @@ abstract class DistributedActorRegistry[M]( implicit m :ClassTag[M] ) extends Ac
       }
 
     case ActorStopped( km ) =>
-      _keepers.remove(km.key) match {
+      _actors.remove(km.key) match {
         case Some( reg ) if km.version != reg.mapping.version =>
-          _keepers + ( km.key -> reg )
+          _actors + ( km.key -> reg )
           log.debug("received keeper stopped. Stopping {}" format( km ))
 
         case _ => // do nothing
@@ -489,9 +504,9 @@ abstract class DistributedActorRegistry[M]( implicit m :ClassTag[M] ) extends Ac
     case ActorStarted( reg ) =>
       getActor( reg.mapping.key ) match {
         case Some( existing ) if existing.mapping.version < reg.mapping.version => // update
-          _keepers += ( reg.mapping.key -> reg )
+          _actors += ( reg.mapping.key -> reg )
         case None =>  // set
-          _keepers += ( reg.mapping.key -> reg )
+          _actors += ( reg.mapping.key -> reg )
 
         case _ => // ignore
       }
@@ -500,10 +515,10 @@ abstract class DistributedActorRegistry[M]( implicit m :ClassTag[M] ) extends Ac
       getActor( reg.mapping.key ) match {
 
         case Some( existing ) if existing.mapping.version < reg.mapping.version => // update
-          _keepers += ( reg.mapping.key -> reg )
+          _actors += ( reg.mapping.key -> reg )
           action.handle(reg)
         case None =>  // set
-          _keepers += ( reg.mapping.key -> reg )
+          _actors += ( reg.mapping.key -> reg )
           action.handle(reg)
 
         case _ => // ignore
@@ -535,7 +550,7 @@ abstract class DistributedActorRegistry[M]( implicit m :ClassTag[M] ) extends Ac
     case Terminated( aRef ) =>
       val key = pathToKey( aRef.path )
 
-      _keepers.remove( key ) match {
+      _actors.remove( key ) match {
 
         case Some( reg ) if ( ! reg.actor.isTerminated ) =>
           context.stop( reg.actor )
